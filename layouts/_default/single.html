@@ -1,0 +1,12 @@
+{{ define "main" }}
+<article>
+  <h1>{{ .Title }}</h1>
+  {{ if not .Date.IsZero }}
+  <time class="post-date" datetime="{{ .Date.Format "2006-01-02" }}">{{ .Date.Format "2006年01月02日" }}</time>
+  {{ end }}
+  <div class="content">
+  {{ .Content }}
+  </div>
+</article>
+<p><a href="{{ "/" | relURL }}">← 返回首页</a></p>
+{{ end }}

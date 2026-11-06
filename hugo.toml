@@ -1,0 +1,7 @@
+baseURL = "https://blog.bd4two.eu.org/"
+locale = "zh-CN"
+title = "BD4TWO 的博客"
+disableKinds = ["taxonomy", "term"]
+
+[params]
+  description = "BD4TWO 的个人博客：无线电、技术与生活。"
