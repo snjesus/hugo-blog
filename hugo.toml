@@ -1,7 +1,41 @@
 baseURL = "https://blog.bd4two.eu.org/"
-locale = "zh-CN"
+locale = "zh-cn"
+defaultContentLanguage = "zh-cn"
 title = "BD4TWO 的博客"
 disableKinds = ["taxonomy", "term"]
 
 [params]
   description = "BD4TWO 的个人博客：无线电、技术与生活。"
+  defaultTheme = "auto"
+  ShowReadingTime = true
+  ShowShareButtons = true
+  ShowPostNavLinks = true
+  ShowBreadCrumbs = true
+  ShowCodeCopyButtons = true
+  ShowToc = true
+  mainSections = ["posts"]
+
+[menu]
+  [[menu.main]]
+    identifier = "home"
+    name = "首页"
+    url = "/"
+    weight = 1
+  [[menu.main]]
+    identifier = "archives"
+    name = "归档"
+    url = "/archives/"
+    weight = 2
+  [[menu.main]]
+    identifier = "search"
+    name = "搜索"
+    url = "/search/"
+    weight = 3
+  [[menu.main]]
+    identifier = "about"
+    name = "关于"
+    url = "/about/"
+    weight = 4
+
+[outputs]
+  home = ["HTML", "RSS", "JSON"]
