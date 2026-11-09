@@ -22,6 +22,7 @@ date: 2026-11-09
 | 呼号 / DMR ID | BR4SN / 460042 |
 | 频率 | RX 434.750 MHz / TX 439.750 MHz，双工 |
 | 网络 | Brandmeister 主站 4602（中国，43.129.83.124） |
+| YSF 反射器表 | 1,508 条（refcheck 官方源，每日自动更新） |
 | 状态 | `Logged into the master successfully`，实测 0% 丢包 |
 
 ---
@@ -388,18 +389,20 @@ releases/            2022-Nov-22
 |---|---|---|---|
 | `P25Hosts.txt` | **674 行** | 231 行 | 设备更全，保持 |
 | `NXDNHosts.txt` | **522 行** | 162 行 | 设备更全，保持 |
-| `YSFHosts.txt` | 1325 行（**8 字段**） | 1384 行（6 字段） | 格式不兼容，保持 |
+| `YSFHosts.txt` | 1325 行（**8 字段**） | 1384 行（6 字段） | 已更新，详见 7.5 |
 
-YSF 那份尤其要小心：设备上的格式是 pistar/Wires-X 的 8 字段版（`ID;国家;描述;IP;端口;时隙;URL;标志`），pistar 的是 6 字段版，**换过去会直接破坏 YSFGateway 的解析**。
+P25 和 NXDN 保持不动：设备现值条目明显更多，覆盖会丢东西。
 
-而它们的现役源 `hostfiles.refcheck.radio` 现在改成了**凭呼号换 token 的门禁**：
+YSF 那份当时被我判为"格式不兼容，保持"——**这个结论后来被推翻了**，原因见 7.5。真正需要小心的不是字段数，而是这个文件到底被谁读。
+
+它们的现役源 `hostfiles.refcheck.radio` 现在改成了**凭呼号换 token 的门禁**（准确的接口形态见 7.5）：
 
 ```
-POST /api/hostfile-gate/open/  {"callsign":"BR4SN"}  →  token
-GET  /api/hostfile-gate/fetch/YSFHosts.txt/   Authorization: Token <token>
+POST /api/hostfile-gate/open/  {"callsign":"BR4SN"}  →  {"token":"..."}
+GET  /api/hostfile-gate/fetch/<mode>/                Authorization: Token <token>
 ```
 
-条款里写明「每个 hostfile 每小时只能取一次」「禁止大规模客户端软件拉取」。个人单机热点属于允许用途，但受限于限流——我探测时直接吃到了 429，路由器侧直连也被拒（rc=8）。
+条款里写明「每个 hostfile 每小时只能取一次」「禁止大规模客户端软件拉取」。个人单机热点属于允许用途，但受限于限流——我探测时直接吃到了 429。
 
 ### 7.4 顺带纠正一个我自己的误判
 
@@ -414,6 +417,148 @@ busybox wget  → https://www.baidu.com/  OK
 **这台设备的 `uclient-fetch` 不支持 TLS，busybox `wget` 支持。** 一个工具的参数差异，差点让我把整个方案建立在错误前提上。
 
 > MMDVM 包里的更新脚本用的正是 `wget`——如果当初先读包里的脚本，可能早就发现这点了。
+
+### 7.5 更新 YSF 列表：先搞清楚"谁在读这个文件"
+
+上一节我把 YSF 列表判成"格式不兼容，保持"。隔了一段时间决定更新它，重做了一遍判断——**结论变了，但不是因为找到了新源，而是因为我搞错了判断依据。**
+
+#### 第一步：全量扫二进制，确认谁真的读它
+
+```sh
+for b in /usr/sbin/* /usr/bin/*; do
+  [ -f "$b" ] || continue
+  s=$(strings "$b" 2>/dev/null | grep -icE "ysfhosts")
+  [ "$s" != "0" ] && echo "$b -> $s hits"
+done
+```
+
+结果只有一条：
+
+```
+/usr/sbin/YSFHostsUpdate.sh -> 4 hits
+```
+
+**除下载脚本本身外，没有任何 C++ 程序引用过 `YSFHosts.txt`**——`MMDVMHost`、`YSFGateway`、`YSFParrot` 全部零命中。这直接推翻了"换过去会破坏 YSFGateway 解析"的说法：YSFGateway 根本不读它。
+
+但它也不是死数据。它是 LuCI 里 **YSFGateway → Startup Reflector** 下拉框的数据源：
+
+```lua
+-- /usr/lib/lua/luci/model/cbi/mmdvm/config_dvmode.lua
+o = s:option(ListValue, "Startup", translate("Startup Reflector"))
+for _, r in ipairs(mmdvm.get_ysf_list()) do
+    o:value(r[2], r[1] .. " - " .. r[2])
+end
+```
+
+```lua
+-- /usr/lib/lua/luci/model/mmdvm.lua
+function get_ysf_list()
+    local hostfile = "/etc/mmdvm/YSFHosts.txt"
+    local file = assert(io.open(hostfile, 'r'), ...)
+    local data = {}
+    for line in file:lines() do
+        local tokens = line:split(";")
+        table.insert(data, {tokens[1], tokens[2]})
+    end
+    return data
+end
+```
+
+注意这个解析器**不跳过 `#` 注释行，也不跳过空行**——和同文件里的 `_get_p25_nxdn_list()` 不同（后者有 `line:byte(1) ~= 35` 的判断）。所以上游文件如果带注释头，直接塞进去会在下拉框里多出 6 条垃圾项。**这是更新这个文件的第一约束。**
+
+#### 第二步：接口形态踩了三个坑
+
+`hostfiles.refcheck.radio/YSFHosts.json`（g4klx 脚本里写的那个地址）已经 **404**，现役接口是：
+
+```
+POST /api/hostfile-gate/open/  {"callsign":"BR4SN"}  →  {"token":"bcf28183..."}
+GET  /api/hostfile-gate/fetch/<mode>/   Authorization: Token <token>
+```
+
+三个坑，每个都卡住过一轮：
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| 证书 CN 不含 `www` | `curl https://www.refcheck.radio/...` → `SSL: no alternative certificate subject name matches` | 用 `refcheck.radio`（不带 www） |
+| 认证头前缀不是 `Bearer` | `Authorization: Bearer <tok>` → 401 | 是 `Authorization: **Token** <tok>` |
+| fetch 末段是 **mode 不是文件名** | 传 `YSFHosts.txt` → 400 `Invalid mode 'ysfhosts.txt'` | 合法值：`dcs dextra dmr dplus fcs m17 nxdn p25 xlx ysf` |
+
+另外这台机器上 **`curl` 的 LibreSSL 握手失败而 Python 的 `ssl` 正常**，路由器上的 busybox `wget` 也正常。所以「本机能 curl 就等于路由器也能 wget」的直觉在这里不成立，得分工具验证。
+
+#### 第三步：格式对齐
+
+上游是 7 段（末尾 URL 为空），设备上是 8 段（多一列 `Location`）。上游缺的这列在设备现值里 1324 条是 `0`、1 条是 `1`，属于可选字段。我补成 `0` 以保持与历史格式一致：
+
+```awk
+awk -F';' '{
+    sub(/\r$/, "");
+    if ($0 ~ /^#/ || $0 ~ /^[[:space:]]*$/) next;
+    if (NF < 5) next;
+    for (i = 1; i <= NF; i++) { gsub(/^[ \t]+/, "", $i); gsub(/[ \t]+$/, "", $i); }
+    if (NF < 8) { for (i = NF + 1; i <= 8; i++) $i = ""; }
+    if ($8 == "") $8 = "0";
+    print $1";"$2";"$3";"$4";"$5";"$6";"$7";"$8;
+}' input > output
+```
+
+这段 awk 在 **Mac 的 awk 和路由器的 busybox awk 上输出逐字节一致**（md5 均为 `88173b781abfef08483b589f4f9ba7cf`，1508 行）——跨实现一致性是必须验的，否则"在我这跑得好好的"上线就变形。
+
+#### 第四步：用连通性证明新列表更好，而不是数行数
+
+新旧两份列表的条目**几乎不重叠**（`host:port` 交集仅 253 条，主机 IP 交集 209/1004），所以"1325 vs 1508 谁多"这个问题本身就没有意义。唯一有意义的判据是：**里面的主机还活着吗。**
+
+这里又踩了一个坑。我的 Mac 上有透明代理：
+
+```
+对照组(随机IP + 随机端口)  可连通 49/50   ← 随机 IP 都能连上
+```
+
+**Mac 侧所有 TCP 连通性测试全部作废**，连真活着的和随手编的 IP 结果一样。改到路由器侧测（路由器出口没有代理）：
+
+```sh
+ping -c 1 -W 3 <host>   # busybox 没有 timeout applet，nc 也不支持 -w，ping 是唯一可靠手段
+```
+
+各抽样 60 条：
+
+| 列表 | 来源 | ping 存活 |
+|---|---|---|
+| 设备现值 | ostar 老列表 | **23/60（38%）** |
+| 新版 | refcheck 官方 | **37/60（62%）** |
+
+老列表里大量 `100.x.x.x` 这类 CGNAT 段地址，明显是历史垃圾数据。新列表明显更活跃，**替换是净收益**。
+
+#### 第五步：限流与自动化
+
+```
+HTTP 429  {"detail":"Request was throttled. Expected available in 3129 seconds."}
+```
+
+限流是 **按呼号共享额度、每文件每小时一次**——Mac 上取过一次，路由器用同一个 token 再取同样被拒（token 由呼号决定，Mac 和路由器拿到的是同一个）。所以：
+
+- 每天 cron 跑一次完全安全（间隔 24 小时 >> 1 小时）
+- 想手动重跑，必须等窗口
+
+脚本 `/usr/sbin/mmdvm-ysfhosts-update.sh` 做三件事：**换 token → 带 `Authorization: Token` 拉取 → 规范化后校验再替换**。校验含两条硬保护，任一不满足就保留旧文件：
+
+1. 有效条目 < 500 → 上游异常，放弃替换
+2. ID/端口非数字、或频率段不是 3 位数字 → 放弃替换
+
+第一次实跑时它正确地**拒绝替换并保住了旧文件**（当时还在 429 窗口内）：
+
+```
+[2026-11-09 10:45:50] === YSFHosts update start ===
+[2026-11-09 10:45:52] token acquired
+[2026-11-09 10:45:54] ERROR: fetch failed
+```
+
+这也是为什么更新脚本必须**先校验后替换**，而不是直接 `wget -O` 覆盖目标文件——前者在上游抽风时保住现场，后者直接把你的可用列表清零。
+
+cron 加在 04:57（排在日志清理之后，避免和另外两条撞车）：
+
+```
+57 4 * * * /usr/sbin/mmdvm-ysfhosts-update.sh >/dev/null 2>&1
+```
 
 ---
 
@@ -544,6 +689,11 @@ M: DMR Slot 1, received network end of voice transmission from BG3IZE to TG 4600
 | 换固件后 ssh 报主机密钥变了 | 正常 | `ssh-keygen -R 192.168.1.1` |
 | 换了固件后 LuCI 登录不了 | rpcd 密码未同步 | `passwd` 重设后 `/etc/init.d/rpcd restart` |
 | 文件写完看着"少了一半" | jffs2 写入 7.5MB 要约 1 分钟 | 等，别慌 |
+| 本机 curl 报证书主机名不符 | 证书 CN 不含 `www` | 用不带 `www` 的域名 |
+| `Authorization: Bearer` 拿 401 | 该站用的是 `Token` 前缀 | `Authorization: Token <tok>` |
+| fetch 报 `Invalid mode 'ysfhosts.txt'` | 末段是 mode 不是文件名 | 用 `ysf`/`p25`/`nxdn` 等 |
+| 随机 IP + 随机端口都"连得上" | 本机有透明代理 | 连通性测试必须换出口（路由器侧） |
+| 换文件后下拉框多出几行空白项 | 上游带 `#` 注释头，而 LuCI 不跳过 `#` 行 | 入库前剥注释 |
 
 ---
 
@@ -562,6 +712,10 @@ M: DMR Slot 1, received network end of voice transmission from BG3IZE to TG 4600
 6. **24MB 的 flash 上，日志和数据库才是长期住户。** 装得下不等于活得下去。
 
 7. **写文件前想清楚"删掉正在被写的文件"会发生什么。** fd 还开着时删除，省不下空间，还丢数据。
+
+8. **判断"这份数据该不该更新"之前，先搞清楚它被谁读。** 我一度用"字段数不兼容"否决了 YSF 列表的更新，理由其实站不住——`strings` 全量扫一遍二进制，会发现除了下载脚本没有任何程序引用它。"格式不兼容"这种结论，得出结论的**依据**比结论本身更该被复查。
+
+9. **连通性测试先跑对照组。** 本机透明代理会让"随机 IP + 随机端口"都返回连接成功，一组测试全绿但毫无信息量。加一行对照（随机 IP 是否也连得上）就能识破，成本是几秒钟。
 
 ---
 
@@ -588,6 +742,17 @@ nslookup 4602.master.brandmeister.network
 
 # —— 查询 ID 库 ——
 ubus -t3 call dmrid get_by_callsign '{"callsign":"BG2IWK"}'
+
+# —— 手动更新 YSF 反射器表（refcheck 每呼号每文件每小时限一次，别乱试）——
+sh /usr/sbin/mmdvm-ysfhosts-update.sh
+tail -5 /var/log/mmdvm/ysfhosts-update.log
+
+# —— 确认这个文件到底被谁读（结果：只有下载脚本自己命中）——
+for b in /usr/sbin/* /usr/bin/*; do
+  [ -f "$b" ] || continue
+  s=$(strings "$b" 2>/dev/null | grep -icE "ysfhosts")
+  [ "$s" != "0" ] && echo "$b -> $s hits"
+done
 ```
 
 ## 附录 B：文件清单
@@ -600,11 +765,13 @@ ubus -t3 call dmrid get_by_callsign '{"callsign":"BG2IWK"}'
 /etc/mmdvm/DMRIds.dat                 ID 库（318,130 条，每日自动更新）
 /etc/mmdvm/BMMasters.txt              BM 主站表（42 个，DNS 实测存活）
 /etc/mmdvm/FCSRooms.txt               FCS 房间表（3,004 条）
-/etc/mmdvm/{P25,NXDN,YSF}Hosts.txt    镜像自带，保持原样
+/etc/mmdvm/{P25,NXDN}Hosts.txt         镜像自带，保持原样
+/etc/mmdvm/YSFHosts.txt               YSF 反射器表（1,508 条，每日自动更新）
 /etc/mmdvm/RSSI.dat                   射频标定，未动
 /usr/sbin/mmdvm-dmrid-update.sh       ID 库自动更新
+/usr/sbin/mmdvm-ysfhosts-update.sh    YSF 反射器表自动更新
 /usr/sbin/mmdvm-log-clean.sh          日志自动清理
-/etc/crontabs/root                    两条定时任务
+/etc/crontabs/root                    三条定时任务
 /usr/lib/lua/luci/ini.lua             已打补丁（.orig 为原版备份）
 /usr/lib/lua/luci/model/cbi/mmdvm/config_general.lua  已打补丁
 /var/log/mmdvm/                       日志（只保留当天）
@@ -619,7 +786,9 @@ ubus -t3 call dmrid get_by_callsign '{"callsign":"BG2IWK"}'
 ~/Downloads/mmdvm-ipk.tar.gz          包集归档
 ~/Downloads/mmdvm-dmrid-update.sh     Mac 端 ID 库更新
 ~/Downloads/mmdvm-hosts-update.sh     Mac 端服务器列表更新
+~/Downloads/mmdvm-ysfhosts-update.sh  YSF 反射器表更新脚本源码
 ~/Downloads/mmdvm-log-clean.sh        日志清理脚本源码
+~/Downloads/YSFHosts.refcheck-20261109.txt  新版 YSF 表快照（1,508 条）
 ```
 
 ---
