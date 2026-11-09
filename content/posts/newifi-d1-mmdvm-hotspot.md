@@ -23,6 +23,7 @@ date: 2026-11-09
 | 频率 | RX 434.750 MHz / TX 439.750 MHz，双工 |
 | 网络 | Brandmeister 主站 4602（中国，43.129.83.124） |
 | YSF 反射器表 | 1,508 条（refcheck 官方源，每日自动更新） |
+| YSF 模式 | YSFGateway 单实例运行，已链接 `CN-C4FM-BG4IAJ`，与 MMDVM 双向打通 |
 | 状态 | `Logged into the master successfully`，实测 0% 丢包 |
 
 ---
@@ -188,6 +189,8 @@ local key, value = line:match("^([%w_]+)%s-=%s-(.*)$")
 ```
 
 改完实测：空值键保留（`t.General.Id ~= nil` 为真），`uci2ini` 回写立刻生效。
+
+> 这个 `ini.lua` 后来还打了**第二个补丁**（把写后端改成原子写），起因是它在特定时机会把配置文件写成 0 字节——详见 7.6 节。两个补丁针对的是同一个文件里的两个独立缺陷：一个是**读丢**，一个是**写坏**。
 
 ### 4.2 Bug #2：一个无节区限定的 sed 污染了整份配置
 
@@ -424,6 +427,8 @@ busybox wget  → https://www.baidu.com/  OK
 
 #### 第一步：全量扫二进制，确认谁真的读它
 
+我先扫了所有二进制，找 `YSFHosts` 字符串：
+
 ```sh
 for b in /usr/sbin/* /usr/bin/*; do
   [ -f "$b" ] || continue
@@ -438,9 +443,31 @@ done
 /usr/sbin/YSFHostsUpdate.sh -> 4 hits
 ```
 
-**除下载脚本本身外，没有任何 C++ 程序引用过 `YSFHosts.txt`**——`MMDVMHost`、`YSFGateway`、`YSFParrot` 全部零命中。这直接推翻了"换过去会破坏 YSFGateway 解析"的说法：YSFGateway 根本不读它。
+我据此写下结论："除下载脚本本身外，**没有任何 C++ 程序读它**"，还顺手把 7.3 节里"换过去会破坏 YSFGateway 解析"的说法也一并否掉了。
 
-但它也不是死数据。它是 LuCI 里 **YSFGateway → Startup Reflector** 下拉框的数据源：
+**这个结论是错的。** 错在一个很基础的地方：**我搜的是文件名，而 ini 里的路径是运行时才读进内存的**——二进制里当然不会有 `/etc/mmdvm/YSFHosts.txt` 这个字符串，它只有 ini 的**键名**：
+
+```sh
+grep -ao "Hosts[=A-Za-z0-9_./-]*" /usr/sbin/YSFGateway
+→ Hosts
+```
+
+正确的证据在配置文件和日志里，一目了然：
+
+```ini
+; /etc/YSFGateway.ini
+[YSF Network]
+Enable=1
+Hosts=/etc/mmdvm/YSFHosts.txt
+```
+
+```
+I: Loaded 1508 YSF reflectors
+```
+
+**教训：判断"某个文件被谁读"，要搜 ini 键名和配置路径，而不是猜文件名。** 更直接的办法是看配置：`grep -r "YSFHosts" /etc/*.ini` 一步到位。
+
+那么它到底影响什么？它是 LuCI 里 **YSFGateway → Startup Reflector** 下拉框的数据源，也是 YSFGateway 解析反射器地址的来源：
 
 ```lua
 -- /usr/lib/lua/luci/model/cbi/mmdvm/config_dvmode.lua
@@ -554,11 +581,260 @@ HTTP 429  {"detail":"Request was throttled. Expected available in 3129 seconds."
 
 这也是为什么更新脚本必须**先校验后替换**，而不是直接 `wget -O` 覆盖目标文件——前者在上游抽风时保住现场，后者直接把你的可用列表清零。
 
+#### 补上第 7 步：替换完必须重启服务
+
+限流窗口过后再实跑，脚本 exit=0、替换成功、权限 0644，**但 YSFGateway 并没有用上新列表**——它还在跑着内存里的旧数据，磁盘上换成新的了。
+
+原因不复杂：程序**不会自动感知 hosts 文件被替换**。`mv` 覆盖会换 inode、改 mtime，它都没反应。所以「每天自动更新」如果只写文件不重启，等于**每天更新一次却要等到设备下次重启才生效**。
+
+于是脚本最后加了一步，并且**顺带验证加载结果**：
+
+```sh
+/etc/init.d/ysfgateway restart
+sleep 15
+YLOG="/var/log/mmdvm/YSFGateway-$(date +%Y-%m-%d).log"
+LOADED=$(grep "Loaded .* YSF reflectors" "$YLOG" | tail -1 |
+	sed -n 's/.*Loaded \([0-9]*\) YSF reflectors.*/\1/p')
+if [ -n "$LOADED" ] && [ "$LOADED" -ge 900 ]; then
+	log "YSFGateway restarted, loaded $LOADED YSF reflectors"
+else
+	log "WARNING: YSFGateway loaded ${LOADED:-0} reflectors - check permissions"
+fi
+```
+
+这个下限校验盯的正是 7.6 节那个坑：**加载数为 0 是"降权读不到文件"的典型特征**，而它不会以任何报错的形式出现。把它变成一条 WARNING，凌晨 4:57 的 cron 日志里就能一眼看见。
+
 cron 加在 04:57（排在日志清理之后，避免和另外两条撞车）：
 
 ```
 57 4 * * * /usr/sbin/mmdvm-ysfhosts-update.sh >/dev/null 2>&1
 ```
+
+### 7.6 列表更新完了，YSF 模式却还是不通
+
+更新完列表，顺手问了一句"YSF 模式到底通不通"，结果查出**四个叠在一起的问题**。这段单独记下来，因为它们有一个共同点：**报错日志完全指不到病根**。
+
+#### 症状
+
+```
+M: 2026-11-09 09:46:08.238 Opening YSF network connection
+I: 2026-11-09 09:46:08.437 Loaded 1321 YSF reflectors
+M: 2026-11-09 09:46:08.506 Automatic (re-)connection to 00516 - "XLX516          "
+M: 2026-11-09 09:46:18.070 Link successful to MMDVM
+W: 2026-11-09 09:48:08.591 Link has failed, polls lost     ← 每 2 分钟一轮
+```
+
+`/etc/init.d/ysfgateway status` 常年报 `not running`，但日志里明明有"Link successful"。反复重连，2 分钟必断。
+
+#### 坑 1：程序降权运行，读不到 640 的文件 —— 静默失效
+
+```
+$ ps w | grep YSFGateway
+28898 root      5036 S    /usr/sbin/YSFGateway
+27771 mmdvm     3400 S    /usr/sbin/YSFGateway     ← 降权后的实例
+```
+
+`/etc/passwd` 里有个 `mmdvm:x:32768:32768:mmdvm:/var/run/mmdvm:/bin/false`。这些程序会**把自己降权到这个用户**再干活。而镜像里所有数据文件都是 `640 root:root`：
+
+```
+-rw-r----- 1 root root 987 /etc/YSFGateway.ini
+-rw-r----- 1 root root 106581 /etc/mmdvm/YSFHosts.txt
+-rw-r----- 1 root root 101594 /etc/mmdvm/FCSRooms.txt
+```
+
+于是 `mmdvm` 用户读不到它们。症状是**最阴的一种**：
+
+```
+I: Loaded 0 YSF reflectors
+```
+
+**零个反射器，而且日志里一句错都没有。** 程序照常启动、照常连接、照常失败，没有任何异常提示。我第一次测新格式时看到 `Loaded 0`，差点得出"新格式不被接受"的结论——其实那个 0 和格式毫无关系，是权限。
+
+更麻烦的是**它会复发**：LuCI 保存配置时走 `mmdvm.lua` 的 `ini_save()` 重写 ini，文件权限被 umask 改成 640。也就是说**在网页上点一次保存，YSF 反射器列表就空了**，而你会以为是配置被改坏了。
+
+修法有两条，都要：
+
+```ini
+; Daemon=0 → 程序不降权，以 root 运行，读权限问题直接消失
+```
+
+```sh
+# init 脚本里固化，防止再被写回 640
+fix_perms() {
+	sed -i 's/^Daemon=1$/Daemon=0/' /etc/YSFGateway.ini
+	chmod 0644 /etc/YSFGateway.ini
+	chmod 0644 /etc/mmdvm/YSFHosts.txt /etc/mmdvm/FCSRooms.txt
+	chown root:mmdvm "$LOG_PATH"; chmod 0775 "$LOG_PATH"
+}
+```
+
+#### 坑 2：`Daemon=1` + procd = 无限 fork
+
+`YSFGateway.ini` 里原本是 `Daemon=1`，意思是"自己后台化"。但它是由 **procd** 托管的（`/etc/init.d/ysfgateway` 里 `procd_set_param respawn`）。两个机制打架：
+
+```
+程序自己 fork 后台化 → 父进程退出 → procd 认为服务挂了 → respawn → 再 fork…
+```
+
+现场是 **29 个 YSFGateway 实例**同时存在，共享同一批端口（`SO_REUSEPORT`），每个都写一份日志，数据互相打架：
+
+```
+$ ps w | grep -c YSFGateway
+29
+```
+
+这也解释了日志里每 2 分钟重复的启动序列——不是重连，是**整个服务在不停重启**。
+
+改成 `Daemon=0`（交给 procd 托管前台进程）后，实例数立刻回到 1：
+
+```
+$ ps w | grep -c YSFGateway
+1
+```
+
+顺带说一句：`/etc/init.d/ysfgateway stop` **杀不掉这些残留实例**，`pkill -f` 在 busybox 上也不认，只能逐 PID kill：
+
+```sh
+for p in $(ps w | grep "[Y]SFGateway" | awk '{print $1}'); do kill -9 $p; done
+```
+
+#### 坑 3：Startup 指向一个不存在的反射器
+
+```
+M: Trying to find non existent YSF reflector with a name of CN-C4FM-BG4IAJ
+```
+
+ini 里 `Startup=CN-C4FM-BG4IAJ`，但**旧的 1325 行列表里根本没有这个名字**（`grep -i C4FM-BG4IAJ` 零命中）。更绕的是 UCI 层写的是另一个名字：
+
+```
+mmdvm.YSFG_Network.Startup='CN-XuZhou'      ← UCI
+Startup=CN-C4FM-BG4IAJ                      ← ini
+```
+
+两层不同步，而 ini 才是实际生效的那一层。于是程序找不到目标，退而连了个不相干的反射器（`00516 XLX516`），再每 2 分钟失败一次。
+
+而**新列表里恰好有 `CN-C4FM-BG4IAJ`**（`46004;CN-C4FM-BG4IAJ;...`），换列表顺带把这个坑填了。
+
+#### 坑 4：`ini.lua` 的写后端先截断再写 —— 配置文件变成 0 字节
+
+前三个坑修完，服务能起来了，但每隔一段时间就崩一次，`procd` 反复拉起，`exit_code` 一直是 **134**：
+
+```sh
+$ ubus call service list '{"name":"ysfgateway"}'
+{
+	"ysfgateway": {
+		"instances": {
+			"instance1": {
+				"running": false,
+				"exit_code": 134
+			}
+		}
+	}
+}
+```
+
+直接前台跑，程序自己说了实话：
+
+```
+Assertion failed: txFrequency > 0U (WiresX.cpp: setInfo: 102)
+```
+
+`TXFrequency` 读成了 0。可配置明明写着 `TXFrequency=439750000`——因为**文件本身是空的**：
+
+```
+$ ls -l /etc/YSFGateway.ini
+-rw-r--r-- 1 root root 0 /etc/YSFGateway.ini      ← 0 字节
+```
+
+再往上看 `ini.lua` 的写后端，问题一目了然：
+
+```lua
+local backends = {
+	io = {
+		lines = function(name) return assert(io.open(name)):lines() end,
+		write = function(name, contents) assert(io.open(name, "w")):write(contents) end,
+	},
+```
+
+两个致命点叠在一起：
+
+1. `io.open(name, "w")` 在 **open 的瞬间就把目标文件截断成 0 字节**；
+2. 写完**从不 `close()`**，数据滞留在用户态缓冲区，等 GC 才落盘。
+
+于是任何一次"open 之后、close 之前"的中断——进程被 kill、崩溃、页面超时——都会留下一个**永久 0 字节的配置文件**。
+
+而这正好和坑 4 的现场严丝合缝地咬合：
+
+```
+ini 被清空(0B)
+   ↓
+TXFrequency 读成 0
+   ↓
+WiresX.cpp:102 断言失败 → SIGABRT → exit 134
+   ↓
+procd respawn → 再读那个 0 字节 ini → 再崩
+   ↓
+崩溃时的截断又把它留成 0 字节
+```
+
+**这是一个自我维持的死循环**，光看日志永远出不来——因为日志是写在崩溃之前的。
+
+修法是把它改成**原子写**：
+
+```lua
+write = function(name, contents)
+	local tmp = name .. ".tmp"
+	local f = assert(io.open(tmp, "w"))
+	f:write(contents)
+	f:close()
+	assert(os.rename(tmp, name))
+end,
+```
+
+先写同目录临时文件、显式 close 落盘、再 rename 覆盖。中途任何失败，**原文件都完好无损**。
+
+光修 ini.lua 还不够——已经躺在 0 字节状态的 ini 需要能自己爬回来，所以 init 脚本里又加了一层自愈：
+
+```sh
+# ini 自愈：被清空或残缺时从 .bak 恢复
+if ! grep -q '^TXFrequency=' /etc/YSFGateway.ini 2>/dev/null; then
+	[ -s /etc/YSFGateway.ini.bak ] && cp /etc/YSFGateway.ini.bak /etc/YSFGateway.ini
+fi
+# 注意顺序：自愈必须在修正 Daemon 之前，
+# 否则从 .bak 恢复出来的 Daemon=1 不会被改掉，实例数又会飙上去。
+if grep -q '^Daemon=1$' /etc/YSFGateway.ini 2>/dev/null; then
+	sed -i 's/^Daemon=1$/Daemon=0/' /etc/YSFGateway.ini
+fi
+```
+
+故障注入验证（把 ini 清空再重启）：
+
+```
+mmdvm: YSFGateway.ini incomplete, restored from .bak
+mmdvm: Starting YSFGateway Service...
+ini: 982B  实例数: 1
+10:Daemon=0
+14:TXFrequency=439750000
+39:Startup=CN-XuZhou
+M: Linked to CN-XUZHOU
+```
+
+#### 修完之后的实测
+
+```
+I: Loaded 3001 FCS room descriptions
+I: Loaded 1508 YSF reflectors
+M: Linked to CN-C4FM-BG4IAJ
+M: Link successful to MMDVM
+```
+
+实例数 1，FCS 房间表和 YSF 反射器表都加载成功，MMDVM 侧 `Link successful to MMDVM` 双向打通，**`Link has failed` 归零**。
+
+> 回头看，这四个坑之所以这么难找，是因为它们的表现全部落在"连不上"这一个症状上，而真正的原因藏在**文件权限**、**进程模型**和**配置文件的写入方式**里——日志格式完全正常，措辞完全正常，只有数字是 `0`。
+>
+> 另一个教训：**我把"新列表 0 个反射器"归因于新格式，是被同一个权限问题误导的第二次**。同一个错误不重复犯第二次，需要的不是"更小心"，而是**换一个能证伪的实验**——比如把权限改掉再测一次，代价只有一条命令。
+>
+> 还有一条更普适的：**"配置文件变成 0 字节"这类故障，修复之后必须做故障注入验证**（手动清空 → 重启 → 确认能自愈）。因为崩溃本身会再次制造 0 字节，**不测这一条，就等于没修**。
 
 ---
 
@@ -672,6 +948,25 @@ M: DMR Slot 1, received network end of voice transmission from BG3IZE to TG 4600
 
 **0% 丢包、BER 0.0**——双工收发、频率、BM 注册、ID 库解码，整条链路都通了。
 
+YSF 侧（修完之后）：
+
+```
+I: Loaded 3001 FCS room descriptions
+I: Loaded 1508 YSF reflectors
+M: Linked to CN-C4FM-BG4IAJ
+M: Link successful to MMDVM
+```
+
+MMDVM 侧对应：
+
+```
+I:     YSF: enabled
+I:     YSF TX Level: 50.0%
+M:     Opening YSF network connection
+```
+
+实例数稳定为 1，`Link has failed` 不再出现。
+
 ---
 
 ## 十一、踩坑速查表
@@ -694,6 +989,12 @@ M: DMR Slot 1, received network end of voice transmission from BG3IZE to TG 4600
 | fetch 报 `Invalid mode 'ysfhosts.txt'` | 末段是 mode 不是文件名 | 用 `ysf`/`p25`/`nxdn` 等 |
 | 随机 IP + 随机端口都"连得上" | 本机有透明代理 | 连通性测试必须换出口（路由器侧） |
 | 换文件后下拉框多出几行空白项 | 上游带 `#` 注释头，而 LuCI 不跳过 `#` 行 | 入库前剥注释 |
+| YSFGateway 日志报 `Loaded 0 YSF reflectors` | 降权到 `mmdvm` 后读不到 640 的 ini/列表文件 | 文件设 0644，且 `Daemon=0` 让它以 root 跑 |
+| YSFGateway 每 2 分钟重连失败一次 | `Daemon=1` 自后台化 + procd respawn = 无限 fork（29 个实例） | `Daemon=0`，实例数回到 1 |
+| LuCI 保存一次配置后 YSF 就断了 | `ini_save()` 按 umask 把 ini 写成 640 | init 脚本里固化 `chmod 0644` |
+| `status` 报 not running 但日志在跑 | `pidof` 与多实例/降权组合误报 | 以 `ps w \| grep` 为准 |
+| 服务反复崩溃 exit 134，ini 变成 0 字节 | `ini.lua` 写后端 `io.open(name,"w")` 先截断且从不 close | 改原子写（临时文件 + rename），并在 init 里加自愈 |
+| `Assertion failed: txFrequency > 0U` | ini 被清空导致频率读成 0 | 恢复 ini + 原子写加固 |
 
 ---
 
@@ -716,6 +1017,10 @@ M: DMR Slot 1, received network end of voice transmission from BG3IZE to TG 4600
 8. **判断"这份数据该不该更新"之前，先搞清楚它被谁读。** 我一度用"字段数不兼容"否决了 YSF 列表的更新，理由其实站不住——`strings` 全量扫一遍二进制，会发现除了下载脚本没有任何程序引用它。"格式不兼容"这种结论，得出结论的**依据**比结论本身更该被复查。
 
 9. **连通性测试先跑对照组。** 本机透明代理会让"随机 IP + 随机端口"都返回连接成功，一组测试全绿但毫无信息量。加一行对照（随机 IP 是否也连得上）就能识破，成本是几秒钟。
+
+10. **同一个错误不要犯第二次——要换一个能证伪的实验。** "新列表加载 0 个反射器"我先归因于格式不对，实际是文件权限。同一个权限问题让我错了两次（先是"没程序读它"，后是"新格式不兼容"），两次都是因为**没有改变关键变量就下结论**。改一行 `chmod` 再测一次，代价是一条命令，收益是整个方向不至于走反。
+
+11. **静默失败比崩溃危险。** `Loaded 0 YSF reflectors` 没有报错、没有异常退出，程序照常"成功"启动。**优先修那些不吭声的故障**，因为它们会一路伪装成"别的功能坏了"。
 
 ---
 
@@ -771,9 +1076,13 @@ done
 /usr/sbin/mmdvm-dmrid-update.sh       ID 库自动更新
 /usr/sbin/mmdvm-ysfhosts-update.sh    YSF 反射器表自动更新
 /usr/sbin/mmdvm-log-clean.sh          日志自动清理
+/etc/init.d/ysfgateway                已加固（权限 + Daemon 固化）
+/etc/YSFGateway.ini                   YSFGateway 配置（Daemon=0）
 /etc/crontabs/root                    三条定时任务
-/usr/lib/lua/luci/ini.lua             已打补丁（.orig 为原版备份）
+/usr/lib/lua/luci/ini.lua             已打两个补丁（.orig 原版、.bak2 原子写前）
 /usr/lib/lua/luci/model/cbi/mmdvm/config_general.lua  已打补丁
+/etc/init.d/ysfgateway                已加固（权限 + Daemon + ini 自愈）
+/etc/YSFGateway.ini                   YSFGateway 配置（Daemon=0，.bak 为健康基线）
 /var/log/mmdvm/                       日志（只保留当天）
 ```
 
