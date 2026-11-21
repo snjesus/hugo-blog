@@ -1,0 +1,330 @@
+---
+title: "解密八重洲手台固件：给 FT-3DR、FT-2DR、FT-5DR 做全中文界面"
+date: 2026-11-22T00:15:00+08:00
+tags: [八重洲, FT-3DR, FT-2DR, FT-5DR, 固件, 汉化, 逆向]
+description: "八重洲手台的官方固件加密与 FT-70D 同源（landaire 的 porkchop）：解密、往返验证、菜单通道翻车与修复、绘制点改接、掩码槽位表、字形四部曲（Fusion Pixel 缩放 → 文泉驿原生位图定案），以及 FTM-400XDR 为什么做不了。"
+---
+
+# 解密八重洲手台固件：给 FT-3DR、FT-2DR、FT-5DR 做全中文界面
+
+> 三台手台没有一台有官方中文界面，但 EXP 固件里都躺着一个日语语言槽位。
+>
+> 这篇文章记录的是把这个槽位"借道"改成中文的完整过程：解密与同源加密的发现、固件结构、第一版在真机上翻车、英文乱码照片实证、日文菜单名"没有表"的真相、绘制点改接、二级菜单的掩码槽位表、四轮字形折腾，最后是车台 FTM-400XDR 的番外——它什么都对，就是没有可刷的界面固件。
+
+---
+
+## 最终状态速览
+
+| 机型 | 目标固件 | 中文版产物 | 状态 |
+|---|---|---|---|
+| FT-3DR | SUB Ver.1.02（2019-12 EXP 包） | `FT3D_SUB_ver102_CN_v5.exe`，SHA256 `aef8dbac…` | 真机验收「完美」，定案 |
+| FT-2DR | SUB Ver.2.01（MAIN 3.10） | `FT2D_SUB_ver201_CN_v2.exe`，SHA256 `e3110f6a…` | 已交付，待真机（先刷 TEST 验链） |
+| FT-5DR | SUB Ver.1.10（2025-11 EXP 包） | `FT5D_SUB_ver110_CN_v2.exe`，SHA256 `e66733bf…` | 已交付，待真机（先刷 TEST 验链） |
+| FTM-400XDR | MAIN Ver.4.50 | —— | 做不了，原因见文末番外 |
+
+三台手台改的都只是 SUB 固件，MAIN（射频控制）一字节不动；英文界面保持原厂原样，这是贯穿全程的硬指标，后面会反复出现。
+
+---
+
+## 一、缘起：日语槽位 + 一把现成的钥匙
+
+### 1.1 为什么盯上日语槽位
+
+八重洲这批手台的语言菜单里只有「日本語」和「ENGLISH」两项。日语这一项的存在本身就是机会：
+
+- 固件里有完整的双字节文本通路（日语汉字就是双字节渲染出来的）；
+- 有一整套双字节字库（日语汉字字库）；
+- 有 EN/JP 并置的双语字符串池。
+
+中文要的正是这三样东西。思路因此很直接：**不新增语言，把日语槽位改名成「中文」，把槽位里的日文字符串换成中文，日文字库里缺的简体字形再逐个替换**。这条路在 FT-710 上是走不通的（那台没有双字节通路，当年重写了渲染函数），手台这边通路现成，工作量完全不同。
+
+### 1.2 加密是现成的：与 FT-70D 同源
+
+固件不在网上裸奔，它藏在官方升级程序 exe 里一个叫 `RES_UPDATE_INFO` 的自定义资源（类型 23）中，是加密的。
+
+决定性发现：**这套加密就是 Landon "landaire" 2021 年逆向 FT-70D 时公开的那套（github.com/landaire/porkchop），而且是逐字节同源**。把 porkchop 常量表里的每个常量拿去 FT-3DR 升级程序里搜，全部命中，连虚拟地址都和 FT-70D 的布局一致（KEY_CONFIG 在 `0x424DE0`、S 盒表在 `0x424E80`……）。八重洲换了载荷和资源名后缀，代码基底没动。
+
+容器格式也完全一样：
+
+- 资源头 4 字节是 Unix 时间戳，用作密钥种子（FT-3DR 的 MAIN 和 SUB 两个 blob 的时间戳只差 152 秒，是同一次构建会话的产物）；
+- 其后是密文（MAIN 1 MiB、SUB 4 MiB）；
+- 尾部带固件大小、加载地址和目标字符串（`FT3DR/E(MAIN)`、`FT3DR/E(SUB)` 之类）。
+
+用未修改的 FT-70D 常量移植一版 Python 解密器，三个镜像（MAIN 的 EXP/USA 两版、SUB）一次解通：
+
+| 镜像 | 明文大小 | 明文 SHA256 |
+|---|---|---|
+| FT-3DR MAIN（EXP） | 1,048,576 B | `8e3ecd05…` |
+| FT-3DR SUB（ALL） | 4,194,304 B | `b93570b3…` |
+
+解出来的明文有正经的向量表、APRS 符号表字符串，SUB 里能直接看到 `LANGUAGE`、`JAPANESE :`、`ENGLISH :`——显示语言菜单在 SUB 里，这件事就此定性。
+
+### 1.3 往返验证：先证明能原样装回去
+
+porkchop 只有解密方向。动手改之前，先按同一规格把加密方向实现出来，验收标准只有一条：**拿原厂 blob 解密 → 用原种子和原尾部重新加密 → 与原厂 blob 逐字节一致**。三个镜像全部通过。再进一步，把零改动的明文塞回一份原厂升级程序的副本里，得到的 TEST 程序与原厂 exe 逐字节一致。
+
+这一步是后面所有工作的地基：任何一版中文固件，最终 exe 里提取出的资源解密后必须与补丁明文逐字节一致，原厂明文重加密必须与原厂 blob 逐字节一致。这两条自检在每一版构建里都跑，不过不许打包。
+
+### 1.4 顺带确认的恢复路径
+
+升级靠机身侧面 DATA 口盖后面的三段程序开关（上 = MAIN 写模式、中 = 正常、下 = SUB 写模式）。写模式下机器在 USB 上枚举为 Renesas 引导设备，实际执行刷写的是 MCU 片内掩膜 ROM 的 boot loader，不依赖 flash 里已有的固件内容——这是"刷坏了也能进写模式刷回原厂"的结构依据。
+
+把话说全：**这条恢复路径在当时是结构推断，没有实测**。后面 FT-3DR 真机把写模式刷入实证了（v1 到 v5 都是这么刷进去的），但"写模式刷回原厂"这一步到今天仍然没人真做过一次，写在每版报告里，不藏。
+
+---
+
+## 二、固件结构：界面全在 SUB 里
+
+FT-3DR 的 SUB 是一颗 Renesas RX 的 4 MiB 镜像（VA = 文件偏移 + `0xFFC00000`），解剖结果：
+
+| 部件 | 位置/规模 | 说明 |
+|---|---|---|
+| 英文菜单名表 | 文件 `0x3DF4D` 起，119 条 × 20 B 定长 | 左对齐 NUL 填充，按索引寻址。记住这张表，第三节它要翻车 |
+| 双语字符串池 | 约 `0x348000–0x34C000` | 走查 1,193 条非空串，EN/JP 成对相邻，同一逻辑 id 两份 |
+| 日文字库 | JIS 14×14 点阵，28 B/格 | 见下 |
+| 校验 | 无 | 整个 SUB 明文里找不到 CRC32 表，镜像与升级尾部里也没有任何校验和/签名字段——这是静态证据（"查无此物"），与升级链无签名检查的结论一致 |
+
+两个编码事实，后面全程要用：
+
+**日文不是 Shift-JIS，是原始 JIS X 0208 码字节**（ISO-2022-JP 去掉转义序列的载荷部分）：每个汉字 2 字节、每字节 `0x21–0x7E`，用 Python 的 `euc_jp` 编码每字节减 `0x80` 互转。铁证是 `JAPANESE:` 后面紧跟的 `日本語` 字节 `46 7C 4B 5C 38 6C`。
+
+**字库覆盖出奇地好**。用固件自己的字形查找算法把 JIS X 0208 全部 8,836 个码位跑一遍：7,434 个码位有字形；汉字区（16–84 区）6,486 个码位里 6,485 个有字形——基本是全量汉字字库。简体中文菜单词汇与 JIS 的关系实测过一轮（30 个常用菜单词、57 个不同汉字）：33 字在 JIS 内且与简体同形或可接受，24 字（设、单、频、语、显、选、择、删、时、间、电、压、扫、锁、蓝、对、记、忆、认、输、开、关、录、复）不在 JIS 内、但都有对应的繁体/日式字形槽位（設、単、頻、語……）。策略因此定为：**字符串按 JIS 码写，把这批槽位里的日式字形逐个换成简体字形**——渲染代码一行不动，显示出来就是真简体。
+
+---
+
+## 三、v1 翻车实录：那张表是英文通道
+
+### 3.1 v1 做了什么
+
+第一版的思路是最顺直的：改字符串、改字形、改语言名。
+
+- 英文菜单名表 119/119 条原位译成中文（20 B 定长字段内）；
+- 字符串池译 50 条，含语言改名：日本語→中文、英語→英文、言語設定→语言设置；
+- 字形替换 89 个：Fusion Pixel 简体字形渲染后写入对应日式字形槽位；
+- 与原厂 diff 共 3,425 字节，全部落在字体区、菜单表、字符串池三处允许区域，代码未动；
+- 打包 `FT3D_SUB_ver102_CN.exe`（SHA256 `f7e5e290…`），往返自检全过。
+
+文件级看，这是一版无可挑剔的构建。然后刷上真机。
+
+### 3.2 真机照片说了什么
+
+刷完选「中文」，菜单还是日文：バンクリンク設定、バンクネーム設定、メモリーネーム設定、メモリープロテクト、メモリースキップ、メモリー書込方法——一张没变。再切到英文模式看，DISPLAY 菜单前六项变成乱码：
+
+```
+L\I80LCV    MeHW    IQCJA]IA    GX8w    8l8@    V"KkN<EY
+```
+
+把 v1 中文表的前六条（目标方位、指南针、频段示波、灯光、语言设置、LCD 亮度）的 JIS 字节逐字节按 ASCII 打印出来，与这六行乱码**逐字一致**。
+
+### 3.3 根因
+
+结论没有第二种可能：**文件 `0x3DF4D` 那张定长表是英文菜单名的通道**。英文模式逐字节按单字节 ASCII 渲染它，所以写进去的 JIS 字节对就成了乱码；而日文模式根本不读这张表，所以菜单纹丝不动。
+
+v1 里对的部分是字符串池翻译和语言改名（选到的「中文」槽位、语言设置页都是对的），错的只有菜单名这一层——恰好是最显眼的一层。教训写下来：**一张"看起来像菜单名表"的表，先证明它被哪条语言通路读，再往里写字**。文件级 diff 审计再干净，也证明不了通道归属；通道归属只能从绘制代码里查，或者像这次一样，被真机照片打脸。
+
+---
+
+## 四、真相：日文菜单名是绘制时拼出来的
+
+### 4.1 没有日文菜单名表
+
+沿着绘制代码追下去，结论是：**日文菜单名根本没有表**。分发代码集中在文件 `0x3097C0–0x30A960`（跳转表 switch + if 链 switch 两种分发），每一项菜单名在绘制时由最多 3 段现拼，段字符串是双语字符串池里的普通记录。段有三种：
+
+| 段类型 | 渲染器 | 编码 | 约束 |
+|---|---|---|---|
+| SB 段 | 单字节绘制（字体 13，7×14） | ASCII + 半角片假名（JIS X 0201）+ 预组合浊音假名 | **单字节里没有汉字，数据层无法承载中文** |
+| JIS 段 | 掩码渲染器 | 16 位掩码逐字节指定哪些字节是双字节码对首字节，原始 JIS 码对绘制 | 窗口 ≤16 B |
+| CHAR 段 | 单字绘制 | 一个硬编码 JIS 字符，固定 x 偏移 | 恰好 1 字 |
+
+大量条目是"片假名前缀（SB 段）+ CHAR 段硬编码的 設、定"的拼法——也就是满屏的「××設定」。有个白捡的便宜：設、定 两字在字形替换后渲染成简体的"设、定"，这类后缀不用改代码就自动变中文。
+
+全量清点：117 个拼装对应英文表 [0..116]，逐项与英文名核对、与 v1 的真机照片核对，无一错位。英文表尾部 [117]/[118] 是打包字段，实际共 121 个名字；最后 4 个（LOCAL NEWS / UPLOAD / DOWNLOAD / SEARCH & DIRECT，WIRES-X 操作菜单）在整个镜像里**没有日文存储**，原厂日文模式本来就回退显示英文——中文版保持英文，与原厂行为一致。
+
+### 4.2 改法：改绘制点，不改段字符串
+
+段字符串大多被多个界面共用，改数据会误伤别的屏。正解是只改**绘制点**：把每项的主段绘制改为调用固件自带的 JIS 掩码渲染器、画一条全新的中文串，其余段的绘制调用一律中和（把调用覆写成无害填充）。新中文串集中放在镜像尾部一片原擦除区（文件 `0x350A00` 起，共 2,064 B，含 102 条字符串和 50 个 16 B 跳板）。
+
+按主段原本的指令形态分四种处理：
+
+| 方法 | 数量 | 说明 |
+|---|---|---|
+| 原位转换 | 45 | SB 主段：整段取址+调用跨度重写为"新串地址 + 掩码 + 调 JIS 渲染器" |
+| 原位重定位 | 5 | JIS 主段且掩码加载形态够长（项 16、53、58、73、74）：直接改指针与掩码立即数 |
+| 跳板调用 | 50 | 掩码加载太短、原位塞不下：跨度改成跳进新表区的 16 B 跳板，由跳板装好参数再调渲染器 |
+| 池层覆盖 | 14 | 该项唯一 JIS 记录恰是 v1 已译好的池记录，菜单层无需动 |
+| 标识符保留 | 3 | DG-ID、RPT ARS、TOT：语言中性，三种模式同形 |
+
+翻译覆盖 117/117。两个例外值得记：项 107 BACKUP 的日文是 バックアップ，译名本想用"备份"，但「份」字不在 JIS X 0208 里、也没有对应槽位，改用同义的「储存」——这是全项目唯一一处被字库逼着改的译名；所有中文名都压在 14 B 以内，无一超过掩码渲染器的 16 B 窗口。
+
+### 4.3 v2 的审计数字
+
+- 总改动 5,527 字节；**英文表区（`0x3DF4D–0x3E8C1`）改动 0 字节**；
+- 独立验证脚本（不共用构建代码）重提取补丁后的分发簇：JIS 渲染器调用 69 次（67 个菜单 + 2 个非菜单调用，未动）、SB 调用 0 次、CHAR 调用 0 次——旧段绘制全部中和完毕；100 个转换项逐项核对新串字节、掩码、站点结构；
+- 打包产物 `FT3D_SUB_ver102_CN_v2.exe`，SHA256 `2503d783…`。
+
+真机结果：菜单名变中文，英文模式恢复干净的原厂英文。v2 之后剩下的事只有两件：二级菜单的漏译，和字形。
+
+---
+
+## 五、二级菜单：掩码槽位表与全 UI 普查
+
+### 5.1 SD 子菜单的两条漏网之鱼
+
+v2 真机照片里，SD CARD 菜单的一级项已经是中文「储存」，但点进去的二级动作还是日文：`SDに書き込み`、`SDから読み込み`。这两条不在 117 项拼装范围内，也不在普通字符串池里——它们躺在一张**固定 18 字节槽位表**里：
+
+```
+槽格式：[掩码:2B 大端][字符串][NUL][零填充]，共 18 B
+掩码 bit (15−i) 置位 ⇔ 字符串第 i 字节是 raw-JIS 码对的首字节
+日文表基址：文件 0x34A397；英文表基址：文件 0x34A3F1；各 5 槽（2 槽在用、3 槽空）
+```
+
+代码里同一函数按语言选基址、索引 ×18 取槽，绘制走同一个掩码渲染器。这两条记录 v1 阶段其实被普查扫到过，但当时没认出掩码前缀的格式，归进了"编码未明、跳过"。
+
+译法是位置保持：`SD` 两字节不动，其后每个码对位置仍放码对、不足处用 JIS 空格对 `0x2121` 填，**掩码逐字节不变**：槽 0 译为「SD写入」、槽 1 译为「SD读取」。「卡」字只有 JIS X 0212 编码、X 0208 里没有，所以标签不写"SD卡"；写入/读取四字都是字库自带字形（其中"读"借映射到 読 的槽位并做字形替换）。英文槽位表逐字节未动。
+
+### 5.2 全 UI 普查：还剩什么日文
+
+借这次清扫把整个 UI 做了一次普查（池记录逐条审阅 1,470 条 + 全镜像日文词汇搜索 + JIS 游程扫描 + SB 字符串扫描 + 代码引用核对），结论分三类：
+
+- **已译**：v1 池层 + v2 菜单 117 项 + v3 新增的 SD 两条；
+- **故意保留**：只剩 3 个短标签、6 条 SB 记录——レベル（"电平"，4 条记录）、パスワード（"密码"，APRS 报文屏的字段标签）、一条 `BAND CONTINUEレベル ` 混合记录。它们是 SB（单字节）编码，SB 字体里根本没有汉字，**在记录内无法编码中文**；要改只能逐屏改绘制点，为三个短标签动代码的风险收益不成立，留档不动；
+- **根本不存在日文版**：COMPLETED、DELETE?、FORMAT?、Now Charging 这类状态/对话框字符串约 45 条，全镜像搜索证实没有日文版——原厂在两种语言模式下都显示英文，不是漏译。
+
+这一版（v3）总改动 5,624 字节，英文区仍为 0 改动；v2→v3 的差异严格局限于 SD 两槽 + 字形格（1,615 字节，0 越界）。
+
+---
+
+## 六、字形四部曲：从能用到原生
+
+菜单通了之后，剩下的全是字形观感问题，前后折腾了四轮。这一节是全篇最值得看的部分：**每一轮的"修法"都被下一轮的实测推翻，靠的全是量测而不是感觉**。
+
+### 6.1 第一轮：Fusion Pixel 13px（v1/v2）
+
+简体字形最初用 Fusion Pixel Font 的简体字按 13px 渲染进 14×14 格（v1 共 89 格，v2 按新译名集调整为 82 格）。能显示，但真机反馈：字偏大，挤。
+
+### 6.2 第二轮：降到 12px（v3）
+
+全部替换字形改按 12px 居中重渲（83 格，含新增的"读"）。刷上之后用户翻 CONFIG 菜单拍照反馈：个别字又偏小，并点名了 16 个字：开、机、软、传、电、扩、频、设、气、转、动、铁、线、优、带、宽。照片里「频率步进」的"频"明显小于旁边的"率"，「接收省电设置」的"电、设"小于"接、省"。
+
+### 6.3 第三轮：先量再改——问题不在个别字（v4）
+
+不猜，先量。把原厂字库 6,485 个汉字格和 v3 的 83 个替换格逐格量墨迹（实际着墨像素的外接框）：
+
+| 对象 | 墨迹尺寸 | 落点 |
+|---|---|---|
+| 原厂汉字（中位数） | **13×13**（96.9% 的格恰为 13 高） | (1, 0) |
+| v3 全部 83 个替换格 | **全部恰为 11×11**，无一例外 | (1, 1) |
+
+结论和直觉相反：**被点名的 16 个字在替换集内部根本不是异常值**——Fusion Pixel 名义 12px 渲染的实际墨迹就是 11×11，整批替换字比原厂整整小 2px（高、宽各 2），混排在同一行里才逐字显形。（顺带验证：v2 名义 13px 时墨迹是 12×12，同样小于原厂。）
+
+v4 的修法是归一化：每字大图渲染后裁墨迹、等比缩放至墨迹高恰为 13、放入原厂的 13×13 墨迹框（原点 (1,0)）、二值化。结果 83 字墨迹全部恰为 13×13，偏差 0；点名 16 字逐字验收全过；字符串级验收——「频率步进」四字、「接收省电设置」六字——全部同高。v3→v4 改动 1,962 字节，全部落在 83 个字形格内。
+
+然后真机评价：**尺寸齐了，但放大出来的字笔画粗细不匀，不如原生字好看**。否决得对——把一套按 12px 设计的点阵字拉伸到 13，笔画不匀是数学上必然的，调参数救不了。
+
+### 6.4 第四轮：文泉驿原生位图定案（v5）
+
+换思路：不再缩放任何东西，去找一套**原生就按这个尺寸逐字画出来的**点阵字。文泉驿点阵宋体是手工多 strike 点阵字体（Ubuntu 包 `xfonts-wqy`，GPL-2 with font embedding exception），把包里 5 个 strike 对 83 个目标字逐字实测：
+
+| strike | PIXEL_SIZE | 83 字墨迹众数 | 结论 |
+|---|---|---|---|
+| wenquanyi_9pt.pcf | 12 | 11×11 | 太小，就是 v3 的问题 |
+| wenquanyi_10pt.pcf | 13 | 12×12 | 仍小 |
+| **wenquanyi_13px.pcf** | **14** | **13×13** | **选用：原生墨迹恰入原厂框** |
+| wenquanyi_11pt.pcf | 15 | 14×14 | 溢出，要削字，不用 |
+| wenquanyi_12pt.pcf | 16 | 15×16 | 远超，不用 |
+
+选用的 strike 是 14px em（与电台 14×14 字格同尺寸），83 字覆盖 83/83，墨迹原生即 13×13。对齐只做平移：按每字自己的 PCF 度量（lsb / ascent）摆进原厂墨迹框，**零缩放、零削字**，程序化校验 83 字墨迹全部落在框内、溢出 0。其中 73 字恰为 13×13；另 10 字（开、显、双、码 12 高，启、动、时、闪、电 12 宽，间 11 宽）是源字体本身的较小设计，与原厂字库对同类字的处理约定一致，逐字留档、不是缺陷。
+
+{{< figure src="data:image/png;base64,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1Ob18+bU3aSKRvoRitIetZaMJgEgJCYBICQmASAkJgEgJCYBICQmASAkJgEgJCYBICQmASCkCk+b29HT07VlazQ3v2o4jay5qBo9+bU5mT23vibRZoqqptRIRZuiqmKVh9EkAITEJACExCQAhMQkAITEJACExCQAhMQkAITEJACExCQAhFThoQCN1AQpSrFtzq6mlK0V93a7aqQfsxVVu2o8MJoEgJCYBICQmASAkJgEgJCYBIDQKGLyE59YtXfvnve+9w8qUzo7O/fu3TPsf52dnTm0FgDGlNEkAISac9/kggWLK483bryrKesEgMI1Jyb7+/ubsh4AKJURYrL6K8ZJk16YJMkpp5zS2dl5+PCT+/Y9mm/TaIaOvr6Bep/bSF2PVqz6kd3muvfG+nlz6m4SVDRSTUmNnkaMEJNDz6C+4x2XveMdl61b96V3vvNdubUKAErBJTwAEBohJqdNm17574tf/KckSW666a+nTZtuKAnAeNACo8mFC7suu+yK9HFv74opU06bMuW03t4V6ZSrr373BRe8rLjWAdDOWumHtK6++t2rVq08ePDAySefUpnypS/90969DxfbMADaValHk729K3p7Vyxc2DVz5jm9vSs+/vGPLlt2bSUjkyT5+Mc/+vrX/+Z5551fYCMBaGM1jSavvfb3Tz/99NmzfyXv1gyyatXKJEnmz3/FmWeetXbtP6ajyd/4jTcYTQIwNmqKyZ6e7lmzXpJ3U4bav//xJEmefvqpo0eP7N//+KmnTqmeO2XKaaeeOuXYY48d+4YBME6M+qTreeed99a3/t8XXvjKPFozomXLrv3yl++8/fY16eMkSZYsWeqkKwA5GfUlPBdf/LqLL37dunVfuueef8mjQYNcdtkVM2eek5aQWL78+nTilCmnpX/29q5YtWplOuik6RqpSlNO+bV5hDXPnpvTdmvaOuNeThWmxomaitXt27fvuOOOPf300ydNmnTw4MEDBw7s3btvTJr3M6ecMuU3fuM3K3+ecMIJSZKkUxYsWHT//fft3l13RTYACNVUrG7x4tds27b9E59Y9aY3/eatt376xhs/MiZtS6ZMOe3pp5/+8Y+ffv7zTzj33I5TT53yxBP7kyRJv48899yOJ57Yf8YZZz700Ilj0x4Axpt875s85ZRTLr/8d5MkqS9Zly27ds2aWx577NGzzz5n9epb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ACJ1xuTMmTM3bryrliWja3xqMehC1uw/GVYj1Vsa0UidlFaUdx2T7Oot+e3PcVWfJVtTqikVxfHYiFJfwtPbuyJ9kI4XK39WGzS+BIAmajQmo8FiZ2dnjcPNDEMv4bn99jWVeygT94QAkLNSjyZf/vIL0wdPPLH/3nu/uW7dHR0dv7RzZ/9DD21PkuSSS960bt0dhw8/WWgbAWhndcbkwMBAelvIpk13J79YG/2DH/zA4sULH3lkb/Z9I7W44IL5P9/cznvv/eb999939dXv/slPfpzG5AUXzPf1JAC5qjMmjx49ml7C2tHRMWjWtGlT04mNXONasXbt588886wXv/jFSZJMmXLa5z532/z5r0i/pFy1aqUbQgDI1ShiMq1Rd9NNf33jjR+pTEy/mxxU0+6d73xXs9rX3f3m5OcXYqXfRG7e/K30O8tBt4s0a4sAUDHq0eSkSZM6OzszFpg69fRBCxw58szu3Xui5TO4IQSAYo0iJm+44f133/2NCy985dBLWKu/hlyx4gMf/OAHqufWXfocAIo1ipjct+/R/v7+l7501tBZ1V9DHj58uAntAoASqCkmqy9kvfPOddmFdZr4xSSNy67eUpRGaoIUVRem/SqVNK799kkrVh1qXDmPx/J8DjxvzLYEAC1HTAJASEwCQEhMAkBITAJASEwCQEhMAkBITAJASEwCQKjUP8tM4zr6+gaK2O74rGZCNfWS2kN+NXrKU2cnm9EkAITEJACExCQAhMQkAITEJACExCQAhMQkAITEJACExCQAhFThGdcaqXORX62Toip3tEpNkPJoxRor47Mf8+uLVnwPjJbRJACExCQAhMQkAITEJACExCQAhMQkAITEJACExCQAhMQkAIRU4aHFNFL1o5E1t672qIRSrf1eUeOK2ieNbLdV+tFoEgBCYhIAQmISAEJiEgBCYhIAQmISAEJiEgBCYhIAQmISAEKq8NBi8qvc0So1QZorv1etXtJYKmednWytUqPHaBIAQmISAEJiEgBCYhIAQmISAEJiEgBCYhIAQmISAEJiEgBCqvCMa41UQilqu/lV38ivakwye279z21YfpWJGlHOVo1gXPZjUTWPynM8Gk0CQEhMAkBITAJASEwCQEhMAkBITAJASEwCQEhMAkBIeQFysX7enJZbc8nV/cLLucfK2aox0HIvvOUa3HRiss0VVUFj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V1R7P1Y46QoAITEJACExCQAhMQkAITEJACExCQAhMQkAITEJACHlBca1gYGdGXNnzjxnzFpSrZFWlfO5yey5WXPHpVZ877VrP5azL8rDaBIAQmISAEJiEgBCYhIAQmISAEJiEgBCYhIAQmISAEJiEgBCqvC0uY6+voF4biP1NfKr3JFfrZxCtrt+3py6m1SRXz8WpaGqRg0oth+ztWI1nKLaPJbbNZoEgJCYBICQmASAkJgEgJCYBICQmASAkJgEgJCYBICQmASAkCo8bW5HT0/Xlq3R3HJW/WikVeV8bjJ7btZchsivRk85a9k0rqhjOb+eKs+nk9EkAITEJACExCQAhMQkAITEJACExCQAhMQkAITEJACExCQAhFThGdfyq0qTn0bqerTidhtXzn4cnzr6+gbqfW4r9mMrfsIMZTQJACExCQAhMQkAITEJACExCQChmmLy7ru/vnfvnje84ZLKlM7Ozr179+zdu2fowp/85N/u3bvnve/9g6a1EQAKYjQJAKHmxOSmTXdv2nT3uecOvs3l1a/u2rTp7tWrb23KVgBgjDWnvEBHR0eSJBMnThw0/UUvmtTR0fHss881ZSsAMMZGiMlPfvJvkyT5n//z5h/96Mlvf/v+aLErr7wqSZIrr3znSSedeMEF85IkeeMbf/OlL531gx88fOWVVz355I+a2maappEqGPlV0Ciq+kZO210/b04eq63WKtVMqrVkNaXZcxvc+o6enq4tW+t7bkvusXJud5T9OEJMXnLJ65MkufHGj2zbtj1jsTvvXJckyXvf+wezZr0knfJLv9T5S7/U+cUv/lM6CwBa0ShOus6fP//MM6ft3LnrO995YNgF1q+/a9u27S972a9NmzZt+/aHtm3b/u1vf7tJ7QSAAowiJt/1rndecsnrP/OZv4ticvnyFUmSfPKTf3vJJdPuvHPdjTd+pDltBICClP2GkKuvfvfVV787fdzbu2LKlNOmTDmtt3dF9ZTCGgdAu6tpNHnXXf+cJMmVV171zne+a9gFhtYZuO6691x33XvSx9u3P7Ro0asbaOR/6u5+y7/8yzfXrLnlssuuSJJkzZpbFi9+zQMP/Ov27duasn4AqFbq35tcuLDre9974Omnn65MefjhHzzzzI9nzjxn166dSZLMnHnOY489+uSTTxbXRgDa2QgxuWDB4iRJVq++dWjpgKGLpVas+MDCha/61KdW33rrp9MpR448U1/jFi7s2rBh/U9/+tMLLnjZ/ffflyTJ008/9dxzz02a9KJ9+/YmSTJ16rT9+x87evRofesHgGwjxGR/f3+SJCPmULpY6vDhw0mSHDhwoHpifZ54Yv9FFy1MkuTQoYNpTKbB+a1v3bNs2bVJkqxatXLJkqXPPvvc448/1uC2AGCo5pQXSH3gA71nnnlmdXmBb31r8803f7Luxn384x9Nr9/5+Mc/Wpm4cGHXwoVd6eM0LAEgJ80pL5BauHDhoPICzz773M0319+43t4Vq1atTB8sX359kiSrVq3cv//x+tc4/nT09Q3U+9w2rL5RlJyrt7TiHmukNlAjr7fu7Za8mlIrVsUqpHpUHf1Y0yU8M2bMqNRl/eEPDz3++P5BC3R2diZJsm/fvuOOO/b000+fNGnSwYMHDxw4cPjw4c7OziNHntm9e5if3KrFggWLBk154QsnvepVi7/85X9KkuQ3fuM3v/GNu5566nB9KweAbDXFZPVPfHzmM3/3h3/4x4MW2LjxriRJFi9+zbZt2z/5yb+95JLX33rrp2+88SPd3W/cuPGuum8IeeKJ/WeccWb6IJ0yefLJEyZMOPfcjvR2yXPP7di27f/s3fvsT37ykzrWDwDZSn1DyOHDT65d+/kkSbq735xOWbJk6aZNGw4ffjL9VnJgYOdv//bvfOUrX04v8AGA5hohJqdNm17LWqLF1q69Y+3aO0bdqJ+bOfOcCRMmJFUnqTdv/tbu3buee+659L7JJEl27dq5d+/DdW8CADI0fzR5xx13btu2/Z57/qXpa06SZP78lz/33HMPPfRvS5f+rApPd/dbDh8+/MgjkhKA5htFTKZfOg773WS1O+74p4ZbleUVr7jwFa+4MH2chiUA5GSEmEwvYU1NmjQpe4FI3Ve6pjeBVB5U/gSAsTFCTKaXsKZuuOH911///h/+8FC0QKSJpc8BYCyN4qTrvn2PNl5/DgBaSJ1Xuvb399d4ESzFyq7ekq2QGhkjrrmoVtW93aZUb8muppTfqy5KfnWFinr/pPKrilXO90Aj/Vie11v2n2UGgAKJSQAIiUkACIlJAAiJSQAIiUkACIlJAAiJSQAIiUkACJX6Z5lpXH7VW/KrkdHImsv53GT23Ky5DWuk1klR1Vty3NuZiu3HRqpilVM5j7jmvquNJgEgJCYBICQmASAkJgEgJCYBICQmASAkJgEgJCYBICQmASCkCg+lU87KHXU/d/28ORlPrFF29ZaxrEjSLOVsVZkVVWupnO+usaymZDQJACExCQAhMQkAITEJACExCQAhMQkAITEJACExCQAhMQkAIVV4qFN+1TcaqTaSX52dRrY72qofozXeKtrk93rzrqbU0dc3UO9zy1nvppya249GkwAQEpMAEBKTABASkwAQEpMAEBKTABASkwAQEpMAEBKTABBShafN7ejp6dqytehWjE6bVRtpSvWWRjRSmYjmasXjEaNJAAiJSQAIiUkACIlJAAiJSQAIiUkACIlJAAiJSQAIiUkACKnCQ+lkV41pSbPnNriCjr6+gXqfW1SdHf3YHorqxxy3O8p+NJoEgJCYBICQmASAkJgEgJCYBICQmASAkJgEgJCYBICQ8gLtb/28OS20WppOT5WK7mg5YrLNdW3ZWv+T86veUlBdmEJ0d1/a+EqKqqQzgnK2Kh9N6ceGjsf86MdMTroCQEhMAkBITAJASEwCQEhMAkBITAJASEwCQEhMAkBIeYF20JQbnymcfmwP+rHNHDN16llFtwEASspJVwAIiUkACIlJAAiJSQAIiUkACIlJAAiJSQAIKS/Q8rq6Ls6Ye83ubWPWkjLo6OvLmLujp2fMWlKtu3/XiMvox7HRyDtEP46l/I7lWvqxmphsB2vXfjaadc28OV1bto5hWwo2kDm3kF2xft6cGpfUj2Og7neIfhxjOR3LtfdjhZOuABASkwAQEpMAEBKTABASkwAQEpMAEBKTABASkwAQUl6gzXX09WXfpZuTmTPPyZg7MLBzzFoyNtvNfr2NK6ofs+X9qseboo4L/ZjNaBIAQmISAEJiEgBCYhIAQmISAEJiEgBCYhIAQmISAEJiEgBCqvCMa41U32ikYkh+VT+yWzU+q40UVRGpqJoyjRihzbPnjlVDhlHU0YrRJACExCQAhMQkAITEJACExCQAhMQkAITEJACExCQAhMQkAIRU4YGW10h9lqJq9FAerdjLDbV5lNWUjCYBICQmASAkJgEgJCYBICQmASAkJgEgJCYBICQmASAkJgEgpAoPuShnXY/CWjXKqh9jKb990khtoPxkv96MNq+fN6f5rSmHNuupbHX0o9EkAITEJACExCQAhMQkAITEJACE8orJpUvfvnfvnq985Us5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G++//766twIAkTpPuk6YMGHmzJk1LDaxs7MzSZL+/v46tpKOFzOm7N//+Mc+dlMdawaAWowiJm+44f133/2NAwcOJEkyc+bM9Ie0FixYPOzCS5a8feLE42fMmJ4u5oe0AGhFo4jJffseHToojIaJu3cP86uTANBaaorJ9O7JajVewtrgla40bkdPT9eWrfU9N7sSSlG1TsZnvZtGqimVsx/Hp/arijUelPpKVwAolpgEgJCYBICQmASAkJgEgJCYBICQmASAkJgEgJCYBIBQqX+WmcZlV/3Ir/pGfpVfylkxJO/aQNnVlMZnZaJW1H5VscYDo0kACIlJAAiJSQAIiUkACIlJAAiJSQAIiUkACIlJAAiJSQAIqcJDi1FxZrTyq8/SyJobqSmT33sgY7vr583JaaOUnNEkAITEJACExCQAhMQkAITEJACExCQAhMQkAITEJACExCQAhFThIReN1GfJr2pMIQqv3tJIvZtyaqRGTyu+3sY1sk/KWWup7jbXcTwaTQJASEwCQEhMAkBITAJASEwCQEhMAkBITAJASEwCQEhMAkBIFZ42t6Onp2vL1jzWnF0jI1tRdT0aobbLaBW1x8ZnjZ72Oy7K049GkwAQEpMAEBKTABASkwAQEpMAEBKTABASkwAQEpMAEBKTABBShafNdfT1DeSz5las69GIRmqCJLPnNrk1ozHeeipb6/ZjtvwqW+W33UaMZT8aTQJASEwCQEhMAkBITAJASEwCQEhMAkBITAJASEwCQEh5Aeq0ft6ccbXdwtX9wvVUqeS0W/RyfsRkmytnJZQRtFebu7svbXz1XVu21rf1fLViT2Urth+z5be39WMmJ10BICQmASAkJgEgJCYBICQmASAkJgEgJCYBICQmASCkvEA7aMqNzxROP7YH/dhmjpk69ayi2wAAJeWkKwCExCQAhMQkAITEJACExCQAhMQkAITEJACElBdoeV1dF2fMXbnyL8asJURmz5474jL6sfz0Y3uopR+ricl2sHbtZ6NZDssWoh/bg35sM066AkBITAJASEwCQEhMAkBITAJASEwCQEhMAkBITAJASHmBNrejp6dry9aiWzE6AwM7M+bOnHnOmLWkKdbPm9P4SvRj4fTjsMZDPxpNAkBITAJASEwCQEhMAkBITAJASEwCQEhMAkBITAJASEwCQEgVnnEtu75GOZWzzWWuRVLOPVZUq8rcU0Vpszo7TWc0CQAhMQkAITEJACExCQAhMQkAITEJACExCQAhMQkAITEJACFVeAipvlGtnLVsUuVsW/b7p6g2t27FmXLusaKMZU8ZTQJASEwCQEhMAkBITAJASEwCQEhMAkBITAJASEwCQEhMAkBIFR5C5ay+wWiVs7JMUa1q13d1OXu5EeXpKaNJAAiJSQAIiUkACIlJAAiJSQAIjXCl6969exrfxvbtDy1a9OrG1wMAY8xoEgBCI4wmFyxYnDH33HPPWb361hEXO3LkmTpaBgCFGyEm+/v7s5583LG1LAYALaqmKjwzZkyfOPH44abPSB90dnYO+8TDh5/ct+/RuhtHsdqvrkcjylMTpFVk7zHvrlahH2uKyTVrPj1r1ksyFti48a5hp3/xi/901VXL6mkXAJSAS3gAIDSK0udXXnnVnXeuq3Hh9773D6677j11NQkAyqLUvxDS27uilsUGBnauXn1L3o0BYBxqKCanTZv2/vffkCRJTl9Arlq1ctCU7u63PPzwDzZvvrd64tGjR/PYOgA0FJMnnXTim970m0luMbl//+OXXXbFoCupzjjjzPnzX175c8OG9Rs2rM9j6wBQ6pOuqc2bvzVo+FjR3f2WMW4MAOOKK10BINQCo8n5819efZZ1kH//9+1j2RgAxpUWiMmMbx8vu+yKMW7MuKLuDEALxOTChV0LF3ZFc3ft8lEOQF5aICZdwgNAUVzCAwChmkaTixa9etCUN7zhkptv/sT27Q9NmzY9SZK9e/ckSbJgweLKL2rdeONHbrzxI01pokt4AChKqU+6Tply2rp1d8yf/4oXv/jFQ8vR9fauWLv284888oOTTpr8wx8eKqKBALS5UcTkJz/5t5dc8vr08bp1X0rHkan08aZNd3d0dKRTbrrprxsfTS5bdm2SJN/5zr9+5StfGjp3zZpbfv3XLzn99KlqugKQkxFisvr3lidNmlT7ek855ZTKc48ceWb37j11NG758usz5u7atfNv//b/q2O1AFCjEWKy+veWb7jh/ddf//708eHDTw5deMmSt0+ceHz6+PLLf7fy3O3bHxr67SYAlN8oTrru2/do5QqdYVUPGQ8cOFB/owCgHEaIyeovIEeliVe6UpRBv80yzqlJBOOT+yYBICQmASAkJgEgJCYBICQmASAkJgEgJCYBICQmASAkJgEg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" width="610" class="align-center" alt="字形对照：原厂 / v4 放大版 / v5 文泉驿原生版" caption="12 个替换字的三方对照（×10 放大，红框为原厂墨迹框）：左列原厂对应字，中列 v4 缩放归一化版（尺寸齐了、笔画臃肿粗细不匀），右列 v5 文泉驿原生位图（笔画均匀，与原厂同一设计纪律）" >}}
+
+v5 相对 v4 只改字形格（1,811 字节），对原厂总改动 5,402 字节，英文区依旧 0 改动。产物 `FT3D_SUB_ver102_CN_v5.exe`，SHA256 `aef8dbac…`。真机验收结论是两个字：「完美」。FT-3DR 到此定案，文泉驿原生位图也成为这个系列的字形定案路线，后两台直接沿用，不再走缩放弯路。
+
+---
+
+## 七、FT-2DR 与 FT-5DR：同构，但每台都要重新查
+
+3DR 定案后，2DR、5DR 的修复版按同一套打法重做。先强调：**两台的 v1 都犯了与 3DR v1 相同的通道错误**（中文写进了英文表），从没让它们上真机；修复版全部从原厂明文重建，只复用 v1 的译文数据，不复用 v1 的镜像。两台的拼装机制也都是各自从本机二进制重新推导的，没有套用 3DR 的地址。
+
+### 7.1 FT-2DR：15 个分类拼装函数，SUB 只有 1 MiB
+
+| 项 | 数值 |
+|---|---|
+| 目标固件 | SUB Ver.2.01（EXP 包，MAIN 3.10 / SUB 2.01 / DSP 4.31） |
+| 拼装机制 | 行绘制函数按语言字节分发；英文名走描述符表（`0x60420`），日文名由 **15 个分类拼装函数**绘制时组装 |
+| 清点 | 112 项、142 个段绘制，逐项双路交叉验证（Ghidra 反编译每个拼装函数 + 字节级站点提取器断言一致） |
+| 转换 | **97 项**绘制点改接；30 个次级段绘制中和；新串+桩共 2,592 B 放进 1 MiB 镜像的擦除尾区（文件 `0xAC400`，构建断言该区在原厂全为 `0xFF`） |
+| 保留 | 15 项日文名本身就是纯 ASCII（SCAN RESUME、DG-ID、APRS DESTINATION 等），原厂双语同形 |
+| SD 槽位表 | 同格式 18 B 槽（日文 `0x63C00` / 英文 `0x63C5A`），已译 SD写入/SD读取 |
+| 字符串池 | 沿用 v1 的 13 条 |
+| 字形 | 文泉驿原生位图 **78** 个，零缩放 |
+| 总改动 | **4,728 B**（字形 1,733 · 尾区表 2,494 · 绘制点 411 · 池 64 · SD 槽 26），英文表+标题+描述符区（`0x5F96C–0x604E0`）零改动 |
+| 产物 | `FT2D_SUB_ver201_CN_v2.exe`，1,309,840 B，SHA256 `e3110f6a…` |
+
+1 MiB 的 SUB 内容只填到约 `0xAC2A1`，尾部擦除区放新串表够用，这是这台能用同一打法的前提。分类标题（DISPLAY、CONFIG 等）原厂就是双语共用英文，未动。
+
+### 7.2 FT-5DR：同架构、新代码细节，SUB 1.10
+
+| 项 | 数值 |
+|---|---|
+| 目标固件 | SUB Ver.1.10（2025-11 EXP 包，MAIN 1.21） |
+| 拼装机制 | 与 3DR 同架构：分发代码簇在文件 `0x35F000–0x368000`，179 个绘制点归为 **121 个拼装** |
+| 本机差异 | 绘制 thunk 在掩码加载与调用之间夹有间隙指令（坐标设置）——转换改用桩法：只改 4 字节的调用本身、保留间隙指令 |
+| 转换 | **104 项**（原位转换 47 / 跳板 51 / 重定位 6）+ 池层 14 项 + 标识符保留 3 项；新串表在擦除区 `0x3AA600` |
+| SD 槽位表 | 日文 `0x3A3E3F` / 英文 `0x3A3E99`，已译 SD写入/SD读取，掩码逐字节保留（顺带纠正了 v1 把这两槽误读成状态串的错） |
+| 字符串池 | 40 条 |
+| 字形 | 文泉驿原生位图 **89** 个（本机字库网格与 3DR 逐字节相同，替换集按最终中文串重算） |
+| 总改动 | **5,179 B**，落在 300 个允许区内；英文表区零改动 |
+| 产物 | `FT5D_SUB_ver110_CN_v2.exe`，4,462,608 B，SHA256 `e66733bf…` |
+
+两台共同的短板，如实写：**字符串池覆盖都薄**。5DR 的池层只译 40 条，普查时有 451 条池记录未译（多为非 UI 或未明记录，已存档）；2DR 的池层只有 13 条。后果是菜单名全中文、常用界面中文，但深层冷门界面可能仍有日语残留——这是覆盖缺口，不是正确性风险，后续可以按真机照片逐屏增译。
+
+---
+
+## 八、验证纪律与恢复：哪些是实证，哪些是推断
+
+这个项目从头到尾执行的纪律，列出来供复现者参考：
+
+1. **往返逐字节**：原厂明文重加密 == 原厂 blob；最终 exe 提取资源解密 == 补丁明文。两条不过，不打包。
+2. **diff 审计**：每一版的全部改动必须落在预先声明的允许区域内（池记录、字形格、绘制点跨度、新串表、槽位表），越界字节数必须为 0；**英文表区改动必须为 0**——这是 v1 教训换来的硬断言。
+3. **独立验证脚本**：验证方不复用构建方的内部状态，从镜像重新提取、重新模拟绘制、逐项核对目标中文名。3DR v2/v3、2DR v2、5DR v2 都是构建审计 + 独立验证双过才交付。
+4. **状态分级，不混写**：
+   - FT-3DR：写模式刷入已被真机反复实证（v1–v5 全部经此刷入并正常工作）；**写模式刷回原厂仍未实测**，属推断；
+   - FT-2DR / FT-5DR：**写链未在真机验证过**。所以两台的刷机顺序都写死：先刷零改动 TEST 程序（与原厂升级程序逐字节一致；5DR 的 TEST 包 SHA256 `436284d2…`）验证这台机器的写链通畅、能正常开机，再刷中文版。恢复同理是同模式刷回原厂，标注推断。
+5. **版本串不改**：所有中文版刷完后版本显示仍是原厂版本号（Sub 1.02 / 2.01 / 1.10），"能不能选出中文"才是刷入证据，不靠改版本号自欺。
+
+刷机流程本身三台一致：备份信道到 microSD（刷后首次开机自动全复位）→ 程序开关拨到 SUB 写位置 → 拆电池、接外部电源、USB 连 DATA 口 → 在 Windows 上运行中文版升级程序（约 90 秒）→ 开关拨回中间 → 开机在 LANGUAGE 里选「中文」。
+
+---
+
+## 九、现状
+
+- **FT-3DR：定案。** v5 真机验收「完美」：菜单 117 项全中文 + 池层 + SD 子菜单，英文模式干净，字形与原厂同尺寸同笔画纪律。仅剩 3 个 SB 短标签（レベル、パスワード）因编码层无解保留日文，已留档。
+- **FT-2DR / FT-5DR：中文版已交付，待真机。** 文件级验证全过，机制与 3DR 同源且已在 3DR 上被硬件证明；但这两台的写链和显示效果要等各自刷过 TEST + 中文版、翻过菜单拍照才算数。深层界面的日语残留按照片再增译。
+- 三台的原厂包都留着，恢复路径（推断）随时可用；哪台真刷回过一次原厂，我会在这里补记。
+
+---
+
+## 十、番外：FTM-400XDR 为什么做不了
+
+手台三台收尾后顺手查了车台 FTM-400XDR，结论是**不能**，但卡点很有意思：不在加密。
+
+- 它的 MAIN 固件（Ver.4.50，EXP 包）与手台**同一套加密**：同样的类型 23 容器、同样的 porkchop 常量，用手台工具链原样解开（明文 1 MiB，SHA256 `f1b52671…`），重加密与原厂 blob **逐字节一致**。这一关是满分通过的。
+- 但 MAIN 里**没有任何 UI**：整个 SETUP 菜单的标签集（CONFIG、DISPLAY、RESET/CLONE……）零命中，没有 LANGUAGE/JAPANESE/ENGLISH 字符串，没有日文字串（原始 JIS 与 Shift-JIS 都是 0 段），没有字库。它装的是 APRS 表和 SD/FAT 数据字符串——和手台的 MAIN 一样，是射频/控制的脑子，不是界面。
+- 触摸界面在可拆的**面板（控制头）**里，面板固件版本 1.3。而八重洲**从未发布过 PANEL 固件更新**：美国、AUS、EXP、日本，任何地区的包都只有 MAIN + DSP；MAIN 的升级手册里明写"(PANEL Version No. will not be updated.)"。日本版单独成线也一样只有 MAIN+DSP——日规机的日文界面是出厂时面板里就有的，没有可下载的镜像，就没有"捐赠者"，更没有写入通道。
+
+所以这台不是解不开，是**没有东西可刷**。唯一理论路径是拆开控制头、用编程器硬读面板的 flash 再逆向——高风险的另一类项目，不在本文路线内。哪天八重洲放出面板升级包，先拿 porkchop 试解：这一代产品同平台，面板镜像有不小的概率同源——这句是推测，不是证据。
+
+---
+
+## 附：关键产物一览
+
+| 文件 | 大小 | SHA256（前 8 位） |
+|---|---|---|
+| FT-3DR 原厂 EXP 包 `FT3D_EXP_Firmware_Update_2019_12.zip` | 11,749,494 B | `caa9bc49` |
+| FT-3DR 中文定案 `FT3D_SUB_ver102_CN_v5.exe` | 4,460,864 B | `aef8dbac` |
+| FT-3DR v2（通道修复首版） `FT3D_SUB_ver102_CN_v2.exe` | 4,460,864 B | `2503d783` |
+| FT-2DR 中文版 `FT2D_SUB_ver201_CN_v2.exe` | 1,309,840 B | `e3110f6a` |
+| FT-5DR 中文版 `FT5D_SUB_ver110_CN_v2.exe` | 4,462,608 B | `e66733bf` |
+| FTM-400XD EXP 包（仅 MAIN 可解、无 UI） | 19,999,414 B | `56e01a88` |
+
+工具链备注：解密/加密为 porkchop 算法的 Python 移植（常量取自 landaire 的公开成果）；反汇编用 Ghidra（RX 语言包）与 Rizin 交叉核对；字形取自文泉驿点阵宋体（xfonts-wqy，GPL-2 with font embedding exception）。固件版权归八重洲所有，本文只记方法与实测，不分发固件文件。
